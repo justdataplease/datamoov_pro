@@ -1,0 +1,3 @@
+{$DATAMOOV_SITE_ADDRESS} {
+	reverse_proxy edge:3000
+}

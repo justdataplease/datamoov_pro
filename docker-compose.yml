@@ -1,0 +1,499 @@
+name: ${COMPOSE_PROJECT_NAME:-datamov_platform}
+
+x-bounded-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-python-service: &python-service
+  image: ${DATAMOV_BACKEND_IMAGE:?Set DATAMOV_BACKEND_IMAGE to the backend image tag or digest}
+  pull_policy: missing
+  logging: *bounded-logging
+  user: "10001:10001"
+  read_only: true
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,size=256m,mode=1777
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+
+x-database-environment: &database-environment
+  DATABASE_CONN_MAX_AGE_SECONDS: ${DATABASE_CONN_MAX_AGE_SECONDS:-60}
+  CONTROL_DB_POOL_MODE: ${CONTROL_DB_POOL_MODE:-direct}
+
+x-query-cache-environment: &query-cache-environment
+  QUERY_CACHE_TTL_SECONDS: ${QUERY_CACHE_TTL_SECONDS:-21600}
+  QUERY_CACHE_STALE_SECONDS: ${QUERY_CACHE_STALE_SECONDS:-86400}
+  QUERY_CACHE_MAX_RESULT_BYTES: ${QUERY_CACHE_MAX_RESULT_BYTES:-8388608}
+  QUERY_CACHE_MAX_ENTRIES: ${QUERY_CACHE_MAX_ENTRIES:-10000}
+  QUERY_CACHE_MAX_TOTAL_BYTES: ${QUERY_CACHE_MAX_TOTAL_BYTES:-536870912}
+  QUERY_CACHE_MAINTENANCE_BATCH_SIZE: ${QUERY_CACHE_MAINTENANCE_BATCH_SIZE:-512}
+
+x-python-environment: &python-environment
+  <<: *database-environment
+  FERNET_KEY: ${FERNET_KEY:?Set FERNET_KEY to a Fernet key}
+  ENGINE_DLT_STATE_DIR: /var/datamov/dlt_state
+  ENGINE_LOCAL_DATA_DIR: /var/datamov/data
+  ENGINE_FILESYSTEM_LOCAL_ROOTS: /var/datamov/imports
+  DBT_PROJECT_DIR: /var/datamov/dbt
+  RUNTIME__DLTHUB_TELEMETRY: "false"
+  LOAD__DELETE_COMPLETED_JOBS: "true"
+
+x-web-environment: &web-environment
+  <<: *python-environment
+  DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL to the backend/migration PostgreSQL URL}
+  SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY to a random value of at least 32 characters}
+  INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?Set INTERNAL_API_TOKEN to a random URL-safe token}
+  DATAMOV_INSECURE_DEV_MODE: "false"
+  DATAMOV_INSECURE_HTTP_MODE: "false"
+  DEBUG: "false"
+  GLOBAL_THROTTLE_BACKEND: postgresql
+  THROTTLE_TRUST_X_FORWARDED_FOR: "true"
+  CONTROL_DB_MAX_CONNECTIONS: ${CONTROL_DB_MAX_CONNECTIONS:-120}
+  CONTROL_DB_RESERVED_CONNECTIONS: ${CONTROL_DB_RESERVED_CONNECTIONS:-15}
+  BACKEND_WORKERS: ${BACKEND_WORKERS:-2}
+  BACKEND_THREADS: ${BACKEND_THREADS:-8}
+  QUERY_RUNNER_WORKERS: ${QUERY_RUNNER_WORKERS:-2}
+  QUERY_RUNNER_THREADS: ${QUERY_RUNNER_THREADS:-4}
+  ASSISTANT_WORKER_REPLICAS: ${ASSISTANT_WORKER_REPLICAS:-1}
+  ASSISTANT_WORKER_CONCURRENCY: ${ASSISTANT_WORKER_CONCURRENCY:-4}
+  ASSISTANT_GLOBAL_CONCURRENCY: ${ASSISTANT_GLOBAL_CONCURRENCY:-4}
+  CONTROL_DB_ETL_OPERATIONS_BUDGET: ${CONTROL_DB_ETL_OPERATIONS_BUDGET:-12}
+  ALLOWED_HOSTS: ${ALLOWED_HOSTS:?Set ALLOWED_HOSTS to the public hostname}
+  CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS to the public HTTPS origin}
+  CSRF_TRUSTED_ORIGINS: ${CSRF_TRUSTED_ORIGINS:?Set CSRF_TRUSTED_ORIGINS to the public HTTPS origin}
+  SESSION_COOKIE_SECURE: "true"
+  CSRF_COOKIE_SECURE: "true"
+  TRUST_PROXY_SSL_HEADER: "true"
+  SECURE_SSL_REDIRECT: "true"
+  SECURE_HSTS_SECONDS: "31536000"
+  SECURE_HSTS_INCLUDE_SUBDOMAINS: ${SECURE_HSTS_INCLUDE_SUBDOMAINS:-false}
+  SECURE_HSTS_PRELOAD: ${SECURE_HSTS_PRELOAD:-false}
+
+x-python-volumes: &python-volumes
+  - type: volume
+    source: dlt_state
+    target: /var/datamov/dlt_state
+  - type: volume
+    source: dbt_project
+    target: /var/datamov/dbt
+  - type: volume
+    source: local_data
+    target: /var/datamov/data
+  - type: bind
+    source: ${DATAMOV_IMPORTS_DIR:-./imports}
+    target: /var/datamov/imports
+    read_only: true
+
+services:
+  # Singleton release gate. Every long-running application waits for both
+  # migrations and validation of saved definitions to succeed.
+  init:
+    <<: *python-service
+    # Upgrade-only ownership gate: old releases wrote named volumes as root.
+    # This one-shot process chowns only the three explicit writable mounts,
+    # drops permanently to 10001:10001, then execs the Django release gate.
+    user: "0:0"
+    cap_add: [CHOWN, DAC_OVERRIDE, SETGID, SETUID]
+    command:
+      - python
+      - -m
+      - config.runtime_permissions
+      - --
+      - sh
+      - -ec
+      - >-
+        python manage.py check --deploy --fail-level ERROR &&
+        python manage.py migrate --noinput &&
+        python manage.py validate_definitions
+    environment:
+      <<: *web-environment
+      DATAMOV_SERVICE_ROLE: init
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS},localhost,127.0.0.1,backend,query-runner
+      BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN:-}
+    volumes: *python-volumes
+    networks: [public, control, data]
+    mem_limit: ${INIT_MEMORY_LIMIT:-1g}
+    memswap_limit: ${INIT_MEMORY_LIMIT:-1g}
+    cpus: ${INIT_CPUS_LIMIT:-1.0}
+    pids_limit: ${INIT_PIDS_LIMIT:-256}
+    restart: "no"
+
+  backend:
+    <<: *python-service
+    environment:
+      <<: [*web-environment, *query-cache-environment]
+      DATAMOV_SERVICE_ROLE: backend
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS},localhost,127.0.0.1,backend
+      BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN:-}
+      QUERY_RUNNER_CREDENTIAL_KEY: ${QUERY_RUNNER_CREDENTIAL_KEY:?Set QUERY_RUNNER_CREDENTIAL_KEY to an independent Fernet key}
+      QUERY_RUNNER_CREDENTIAL_TTL_SECONDS: ${QUERY_RUNNER_CREDENTIAL_TTL_SECONDS:-30}
+      AUTO_PROVISION_DEFAULT_MONITORS: ${AUTO_PROVISION_DEFAULT_MONITORS:-true}
+      WORKFLOW_LAUNCH_LEASE_SECONDS: ${WORKFLOW_LAUNCH_LEASE_SECONDS:-300}
+      RUN_CANCEL_ESCALATE_SECONDS: ${RUN_CANCEL_ESCALATE_SECONDS:-600}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-5}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.7-flash}
+      ASSISTANT_TURN_DEADLINE_SECONDS: ${ASSISTANT_TURN_DEADLINE_SECONDS:-600}
+      ASSISTANT_GLOBAL_CONCURRENCY: ${ASSISTANT_GLOBAL_CONCURRENCY:-4}
+      ASSISTANT_EXTERNAL_MAX_WAIT_SECONDS: ${ASSISTANT_EXTERNAL_MAX_WAIT_SECONDS:-30}
+      CHAT_MAX_SCAN_BYTES: ${CHAT_MAX_SCAN_BYTES:-1073741824}
+      CHAT_MAX_ROWS: ${CHAT_MAX_ROWS:-1000}
+      CHAT_MAX_TOOL_TURNS: ${CHAT_MAX_TOOL_TURNS:-64}
+      CHAT_ENABLE_LIVE_API: ${CHAT_ENABLE_LIVE_API:-false}
+      CHAT_MAX_API_RESPONSE_BYTES: ${CHAT_MAX_API_RESPONSE_BYTES:-5242880}
+      CHAT_ALLOW_PRIVATE_API_SOURCES: ${CHAT_ALLOW_PRIVATE_API_SOURCES:-false}
+      ASSISTANT_DRAFT_TTL_SECONDS: ${ASSISTANT_DRAFT_TTL_SECONDS:-86400}
+      PLATFORM_PUBLIC_URL: ${PLATFORM_PUBLIC_URL:-}
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-[]}
+      ASSISTANT_SLACK_INGRESS_RATE: ${ASSISTANT_SLACK_INGRESS_RATE:-600/min}
+      ASSISTANT_GOOGLE_CHAT_INGRESS_RATE: ${ASSISTANT_GOOGLE_CHAT_INGRESS_RATE:-600/min}
+      ALERT_ALLOW_PRIVATE_WEBHOOKS: ${ALERT_ALLOW_PRIVATE_WEBHOOKS:-false}
+      ALERT_ALLOW_PRIVATE_SMTP: ${ALERT_ALLOW_PRIVATE_SMTP:-false}
+      ALERT_WEBHOOK_TIMEOUT_SECONDS: ${ALERT_WEBHOOK_TIMEOUT_SECONDS:-10}
+      ALERT_SMTP_TIMEOUT_SECONDS: ${ALERT_SMTP_TIMEOUT_SECONDS:-10}
+      ALERT_MAX_WEBHOOK_REQUEST_BYTES: ${ALERT_MAX_WEBHOOK_REQUEST_BYTES:-262144}
+      ALERT_MAX_WEBHOOK_RESPONSE_BYTES: ${ALERT_MAX_WEBHOOK_RESPONSE_BYTES:-65536}
+      QUERY_RUNNER_URL: http://query-runner:8000
+      QUERY_EXECUTION_TIMEOUT_SECONDS: ${QUERY_EXECUTION_TIMEOUT_SECONDS:-45}
+      SEMANTIC_SNAPSHOT_CACHE_MAX_ENTRIES: ${SEMANTIC_SNAPSHOT_CACHE_MAX_ENTRIES:-8}
+      SEMANTIC_COMPILED_SQL_CACHE_MAX_ENTRIES: ${SEMANTIC_COMPILED_SQL_CACHE_MAX_ENTRIES:-256}
+      SEMANTIC_COMPILED_SQL_CACHE_MAX_BYTES: ${SEMANTIC_COMPILED_SQL_CACHE_MAX_BYTES:-16777216}
+      DASHBOARD_CACHE_TTL_SECONDS: ${DASHBOARD_CACHE_TTL_SECONDS:-300}
+      DASHBOARD_QUERY_CONCURRENCY: ${DASHBOARD_QUERY_CONCURRENCY:-4}
+      DASHBOARD_CHART_MAX_ROWS: ${DASHBOARD_CHART_MAX_ROWS:-500}
+      DASHBOARD_TABLE_MAX_ROWS: ${DASHBOARD_TABLE_MAX_ROWS:-500}
+      SNAPSHOT_DEADLINE_SECONDS: ${SNAPSHOT_DEADLINE_SECONDS:-240}
+      GLANCES_URL: http://glances:61208
+    volumes: *python-volumes
+    networks: [public, control, data, monitoring]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; r=urllib.request.Request('http://localhost:8000/ready',headers={'X-Forwarded-Proto':'https'}); urllib.request.urlopen(r,timeout=8)"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    mem_limit: ${BACKEND_MEMORY_LIMIT:-1g}
+    memswap_limit: ${BACKEND_MEMORY_LIMIT:-1g}
+    cpus: ${BACKEND_CPUS_LIMIT:-1.0}
+    pids_limit: ${BACKEND_PIDS_LIMIT:-256}
+    stop_grace_period: 70s
+    restart: unless-stopped
+
+  query-runner:
+    <<: *python-service
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=512m,mode=1777
+    command:
+      - sh
+      - -ec
+      - >-
+        python manage.py check --deploy --fail-level ERROR &&
+        exec gunicorn config.query_runner_wsgi:application -b 0.0.0.0:8000
+        --worker-class gthread
+        --workers "$$QUERY_RUNNER_WORKERS" --threads "$$QUERY_RUNNER_THREADS"
+        --timeout 50 --graceful-timeout 55
+    environment:
+      <<: *database-environment
+      DATAMOV_SERVICE_ROLE: query-runner
+      DJANGO_SETTINGS_MODULE: config.query_runner_settings
+      # A global DATABASE_URL is intentionally neither inherited nor read by
+      # query-runner settings. Map the single operator-supplied URL to the
+      # role-specific runtime name instead.
+      QUERY_RUNNER_DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL to the production control database URL}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?Set INTERNAL_API_TOKEN to a random URL-safe token}
+      QUERY_RUNNER_CREDENTIAL_KEY: ${QUERY_RUNNER_CREDENTIAL_KEY:?Set QUERY_RUNNER_CREDENTIAL_KEY to an independent Fernet key}
+      QUERY_RUNNER_CREDENTIAL_TTL_SECONDS: ${QUERY_RUNNER_CREDENTIAL_TTL_SECONDS:-30}
+      ENGINE_DLT_STATE_DIR: /var/datamov/dlt_state
+      ENGINE_LOCAL_DATA_DIR: /var/datamov/data
+      RUNTIME__DLTHUB_TELEMETRY: "false"
+      DATAMOV_INSECURE_DEV_MODE: "false"
+      DATAMOV_INSECURE_HTTP_MODE: "false"
+      DEBUG: "false"
+      CONTROL_DB_MAX_CONNECTIONS: ${CONTROL_DB_MAX_CONNECTIONS:-120}
+      CONTROL_DB_RESERVED_CONNECTIONS: ${CONTROL_DB_RESERVED_CONNECTIONS:-15}
+      BACKEND_WORKERS: ${BACKEND_WORKERS:-2}
+      BACKEND_THREADS: ${BACKEND_THREADS:-8}
+      ASSISTANT_WORKER_REPLICAS: ${ASSISTANT_WORKER_REPLICAS:-1}
+      ASSISTANT_WORKER_CONCURRENCY: ${ASSISTANT_WORKER_CONCURRENCY:-4}
+      ASSISTANT_GLOBAL_CONCURRENCY: ${ASSISTANT_GLOBAL_CONCURRENCY:-4}
+      CONTROL_DB_ETL_OPERATIONS_BUDGET: ${CONTROL_DB_ETL_OPERATIONS_BUDGET:-12}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS},localhost,127.0.0.1,query-runner
+      TRUST_PROXY_SSL_HEADER: "true"
+      SECURE_SSL_REDIRECT: "true"
+      SECURE_HSTS_SECONDS: "31536000"
+      SECURE_HSTS_INCLUDE_SUBDOMAINS: ${SECURE_HSTS_INCLUDE_SUBDOMAINS:-false}
+      SECURE_HSTS_PRELOAD: ${SECURE_HSTS_PRELOAD:-false}
+      QUERY_RUNNER_WORKERS: ${QUERY_RUNNER_WORKERS:-2}
+      QUERY_RUNNER_THREADS: ${QUERY_RUNNER_THREADS:-4}
+      CHAT_MAX_SCAN_BYTES: ${CHAT_MAX_SCAN_BYTES:-1073741824}
+      CHAT_MAX_ROWS: ${CHAT_MAX_ROWS:-1000}
+      QUERY_EXECUTION_TIMEOUT_SECONDS: ${QUERY_EXECUTION_TIMEOUT_SECONDS:-45}
+    volumes:
+      - type: volume
+        source: dlt_state
+        target: /var/datamov/dlt_state
+        read_only: true
+      - type: volume
+        source: local_data
+        target: /var/datamov/data
+        read_only: true
+    networks: [public, control, data]
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; r=urllib.request.Request('http://localhost:8000/ready',headers={'X-Forwarded-Proto':'https'}); urllib.request.urlopen(r,timeout=8)"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    mem_limit: ${QUERY_RUNNER_MEMORY_LIMIT:-2g}
+    memswap_limit: ${QUERY_RUNNER_MEMORY_LIMIT:-2g}
+    cpus: ${QUERY_RUNNER_CPUS_LIMIT:-2.0}
+    pids_limit: ${QUERY_RUNNER_PIDS_LIMIT:-256}
+    stop_grace_period: 70s
+    restart: unless-stopped
+
+  worker:
+    <<: *python-service
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=1g,mode=1777
+    container_name: ${COMPOSE_PROJECT_NAME:-datamov_platform}-worker
+    init: true
+    command: ["python", "manage.py", "worker"]
+    environment:
+      <<: [*python-environment, *query-cache-environment]
+      DATAMOV_SERVICE_ROLE: worker
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL to the application PostgreSQL URL}
+      ENGINE_POSTGRES_IDENTITY_BINDING: ${ENGINE_POSTGRES_IDENTITY_BINDING:-1}
+      ALERT_ALLOW_PRIVATE_WEBHOOKS: ${ALERT_ALLOW_PRIVATE_WEBHOOKS:-false}
+      ALERT_ALLOW_PRIVATE_SMTP: ${ALERT_ALLOW_PRIVATE_SMTP:-false}
+      ALERT_WEBHOOK_TIMEOUT_SECONDS: ${ALERT_WEBHOOK_TIMEOUT_SECONDS:-10}
+      ALERT_SMTP_TIMEOUT_SECONDS: ${ALERT_SMTP_TIMEOUT_SECONDS:-10}
+      ALERT_MAX_WEBHOOK_REQUEST_BYTES: ${ALERT_MAX_WEBHOOK_REQUEST_BYTES:-262144}
+      ALERT_MAX_WEBHOOK_RESPONSE_BYTES: ${ALERT_MAX_WEBHOOK_RESPONSE_BYTES:-65536}
+      WORKER_MAX_CONCURRENT_RUNS: ${WORKER_MAX_CONCURRENT_RUNS:-1}
+      WORKER_IDLE_POLL_MAX_SECONDS: ${WORKER_IDLE_POLL_MAX_SECONDS:-2}
+      WORKER_HEARTBEAT_SECONDS: ${WORKER_HEARTBEAT_SECONDS:-15}
+      WORKER_HEARTBEAT_STALE_SECONDS: ${WORKER_HEARTBEAT_STALE_SECONDS:-120}
+      WORKER_PENDING_MAX_AGE_SECONDS: ${WORKER_PENDING_MAX_AGE_SECONDS:-3600}
+      WORKER_MAX_INFRA_RETRIES: ${WORKER_MAX_INFRA_RETRIES:-2}
+      WORKER_CANCEL_GRACE_SECONDS: ${WORKER_CANCEL_GRACE_SECONDS:-15}
+      WORKER_DRAIN_TIMEOUT_SECONDS: ${WORKER_DRAIN_TIMEOUT_SECONDS:-90}
+      WORKER_STOP_GRACE_SECONDS: ${WORKER_STOP_GRACE_SECONDS:-150}
+      WORKER_LOG_BUDGET_BYTES: ${WORKER_LOG_BUDGET_BYTES:-4194304}
+      WORKER_LOG_RETENTION_DAYS: ${WORKER_LOG_RETENTION_DAYS:-14}
+      WORKER_STATE_DISK_MIN_FREE_GB: ${WORKER_STATE_DISK_MIN_FREE_GB:-5}
+      WORKER_MEMORY_ENVELOPE_MB: ${WORKER_MEMORY_ENVELOPE_MB:-12288}
+      WORKER_DBT_WARN_AS_ERRORS: ${WORKER_DBT_WARN_AS_ERRORS:-false}
+      WORKFLOW_LAUNCH_LEASE_SECONDS: ${WORKFLOW_LAUNCH_LEASE_SECONDS:-300}
+      RUN_CANCEL_ESCALATE_SECONDS: ${RUN_CANCEL_ESCALATE_SECONDS:-600}
+      DBT_PROFILES_DIR: /var/datamov/dbt
+    volumes: *python-volumes
+    networks: [public, control, data]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "test $$(( $$(date +%s) - $$(stat -c %Y /tmp/datamov-worker-liveness 2>/dev/null || echo 0) )) -lt 90"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    mem_limit: ${WORKER_MEMORY_LIMIT:-12g}
+    memswap_limit: ${WORKER_MEMORY_LIMIT:-12g}
+    cpus: ${WORKER_CPUS_LIMIT:-4.0}
+    pids_limit: ${WORKER_PIDS_LIMIT:-512}
+    stop_grace_period: ${WORKER_STOP_GRACE_SECONDS:-150}s
+    restart: unless-stopped
+
+  assistant-worker:
+    <<: *python-service
+    init: true
+    command: ["python", "manage.py", "assistant_worker"]
+    environment:
+      <<: [*python-environment, *query-cache-environment]
+      DATAMOV_SERVICE_ROLE: assistant-worker
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL to the application PostgreSQL URL}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?Set INTERNAL_API_TOKEN to a random URL-safe token}
+      QUERY_RUNNER_CREDENTIAL_KEY: ${QUERY_RUNNER_CREDENTIAL_KEY:?Set QUERY_RUNNER_CREDENTIAL_KEY to an independent Fernet key}
+      QUERY_RUNNER_CREDENTIAL_TTL_SECONDS: ${QUERY_RUNNER_CREDENTIAL_TTL_SECONDS:-30}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-5}
+      ANTHROPIC_MAX_TOKENS: ${ANTHROPIC_MAX_TOKENS:-16384}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.7-flash}
+      ASSISTANT_MODEL_TIMEOUT_SECONDS: ${ASSISTANT_MODEL_TIMEOUT_SECONDS:-120}
+      ASSISTANT_WORKER_CONCURRENCY: ${ASSISTANT_WORKER_CONCURRENCY:-4}
+      ASSISTANT_GLOBAL_CONCURRENCY: ${ASSISTANT_GLOBAL_CONCURRENCY:-4}
+      ASSISTANT_EXTERNAL_MAX_WAIT_SECONDS: ${ASSISTANT_EXTERNAL_MAX_WAIT_SECONDS:-30}
+      ASSISTANT_TURN_LEASE_SECONDS: ${ASSISTANT_TURN_LEASE_SECONDS:-60}
+      ASSISTANT_TURN_HEARTBEAT_SECONDS: ${ASSISTANT_TURN_HEARTBEAT_SECONDS:-10}
+      ASSISTANT_TURN_DEADLINE_SECONDS: ${ASSISTANT_TURN_DEADLINE_SECONDS:-600}
+      ASSISTANT_TURN_ABANDON_SECONDS: ${ASSISTANT_TURN_ABANDON_SECONDS:-300}
+      ASSISTANT_TURN_EVENT_RETENTION_DAYS: ${ASSISTANT_TURN_EVENT_RETENTION_DAYS:-7}
+      ASSISTANT_TURN_RETENTION_DAYS: ${ASSISTANT_TURN_RETENTION_DAYS:-30}
+      ASSISTANT_DRAFT_TTL_SECONDS: ${ASSISTANT_DRAFT_TTL_SECONDS:-86400}
+      PLATFORM_PUBLIC_URL: ${PLATFORM_PUBLIC_URL:-}
+      QUERY_RUNNER_URL: http://query-runner:8000
+      DATABASE_CONN_MAX_AGE_SECONDS: "0"
+      CHAT_MAX_SCAN_BYTES: ${CHAT_MAX_SCAN_BYTES:-1073741824}
+      CHAT_MAX_ROWS: ${CHAT_MAX_ROWS:-1000}
+      CHAT_MAX_TOOL_TURNS: ${CHAT_MAX_TOOL_TURNS:-64}
+      CHAT_ENABLE_LIVE_API: ${CHAT_ENABLE_LIVE_API:-false}
+      CHAT_MAX_API_RESPONSE_BYTES: ${CHAT_MAX_API_RESPONSE_BYTES:-5242880}
+      CHAT_ALLOW_PRIVATE_API_SOURCES: ${CHAT_ALLOW_PRIVATE_API_SOURCES:-false}
+      SEMANTIC_SNAPSHOT_CACHE_MAX_ENTRIES: ${SEMANTIC_SNAPSHOT_CACHE_MAX_ENTRIES:-8}
+      SEMANTIC_COMPILED_SQL_CACHE_MAX_ENTRIES: ${SEMANTIC_COMPILED_SQL_CACHE_MAX_ENTRIES:-256}
+      SEMANTIC_COMPILED_SQL_CACHE_MAX_BYTES: ${SEMANTIC_COMPILED_SQL_CACHE_MAX_BYTES:-16777216}
+    volumes:
+      - type: volume
+        source: dlt_state
+        target: /var/datamov/dlt_state
+        read_only: true
+      - type: volume
+        source: dbt_project
+        target: /var/datamov/dbt
+        read_only: true
+      - type: volume
+        source: local_data
+        target: /var/datamov/data
+      - type: bind
+        source: ${DATAMOV_IMPORTS_DIR:-./imports}
+        target: /var/datamov/imports
+        read_only: true
+    networks: [public, control, data]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      query-runner:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "test $$(( $$(date +%s) - $$(stat -c %Y /tmp/datamov-assistant-worker-liveness 2>/dev/null || echo 0) )) -lt 90"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    mem_limit: ${ASSISTANT_WORKER_MEMORY_LIMIT:-1g}
+    memswap_limit: ${ASSISTANT_WORKER_MEMORY_LIMIT:-1g}
+    cpus: ${ASSISTANT_WORKER_CPUS_LIMIT:-1.0}
+    pids_limit: ${ASSISTANT_WORKER_PIDS_LIMIT:-256}
+    stop_grace_period: 90s
+    restart: unless-stopped
+
+  frontend:
+    image: ${DATAMOV_FRONTEND_IMAGE:?Set DATAMOV_FRONTEND_IMAGE to the frontend image tag or digest}
+    pull_policy: missing
+    logging: *bounded-logging
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=128m,mode=1777,uid=1000,gid=1000
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks: [public]
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    mem_limit: ${FRONTEND_MEMORY_LIMIT:-512m}
+    memswap_limit: ${FRONTEND_MEMORY_LIMIT:-512m}
+    cpus: ${FRONTEND_CPUS_LIMIT:-0.5}
+    pids_limit: ${FRONTEND_PIDS_LIMIT:-128}
+    stop_grace_period: 15s
+    restart: unless-stopped
+
+  edge:
+    image: ${DATAMOV_EDGE_IMAGE:-nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10}
+    pull_policy: missing
+    logging: *bounded-logging
+    user: "101:101"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=16m,mode=1777,uid=101,gid=101
+      - /var/cache/nginx:rw,nosuid,nodev,size=32m,mode=0755,uid=101,gid=101
+      - /var/run:rw,nosuid,nodev,size=4m,mode=0755,uid=101,gid=101
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      com.datamov.edge-mode: secure
+    ports:
+      - "127.0.0.1:${EDGE_UI_PORT:-80}:3000"
+      - "127.0.0.1:${EDGE_API_PORT:-8000}:8000"
+    volumes:
+      - type: bind
+        source: ./nginx/edge.conf
+        target: /etc/nginx/conf.d/default.conf
+        read_only: true
+    networks: [public]
+    depends_on:
+      frontend:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/edge_health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    mem_limit: ${EDGE_MEMORY_LIMIT:-128m}
+    memswap_limit: ${EDGE_MEMORY_LIMIT:-128m}
+    cpus: ${EDGE_CPUS_LIMIT:-0.25}
+    pids_limit: ${EDGE_PIDS_LIMIT:-64}
+    restart: unless-stopped
+
+  glances:
+    image: ${DATAMOV_GLANCES_IMAGE:-nicolargo/glances:latest-full@sha256:58651aabedf62db8bfc1d252f8d3889675dfcdb5d0ad1c177ae5879c21626f3a}
+    pull_policy: missing
+    logging: *bounded-logging
+    environment:
+      GLANCES_OPT: -w --disable-webui
+      HOME: /tmp/glances
+      USER: root
+      LOGNAME: root
+    user: "0:0"
+    pid: host
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=64m,mode=1777,uid=0,gid=0
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks: [monitoring]
+    mem_limit: ${GLANCES_MEMORY_LIMIT:-512m}
+    memswap_limit: ${GLANCES_MEMORY_LIMIT:-512m}
+    cpus: ${GLANCES_CPUS_LIMIT:-0.5}
+    pids_limit: ${GLANCES_PIDS_LIMIT:-256}
+    restart: unless-stopped
+
+networks:
+  public:
+  control:
+    internal: true
+  data:
+    internal: true
+  monitoring:
+    internal: true
+
+volumes:
+  dlt_state:
+  dbt_project:
+  local_data:

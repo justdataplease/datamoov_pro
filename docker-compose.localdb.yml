@@ -1,0 +1,58 @@
+# Optional bundled control database, for installs without a managed PostgreSQL.
+# The application only accepts TLS database connections, so this server turns
+# TLS on with the self-signed certificate that ships in the Debian image. It is
+# reachable only on the internal `control` network and publishes no host port.
+services:
+  db:
+    image: ${DATAMOV_DB_IMAGE:-postgres:18@sha256:86c951e05bf56c93d95d397747fb8820ac76cc3bedb78f43abd83eedbe3666ae}
+    pull_policy: missing
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem
+      - -c
+      - ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
+      - -c
+      - max_connections=${CONTROL_DB_MAX_CONNECTIONS:-120}
+      - -c
+      - idle_in_transaction_session_timeout=300000
+      - -c
+      - log_statement=none
+      - -c
+      - log_min_error_statement=panic
+      - -c
+      - log_parameter_max_length_on_error=0
+    environment:
+      POSTGRES_USER: datamoov
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD for the bundled database}
+      POSTGRES_DB: datamoov
+    volumes:
+      # postgres:18 keeps PGDATA under /var/lib/postgresql/<major>/docker, so
+      # the parent directory is what must live in the volume.
+      - pg_data:/var/lib/postgresql
+    networks: [control]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U datamoov -d datamoov"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: ${POSTGRES_MEMORY_LIMIT:-2g}
+    memswap_limit: ${POSTGRES_MEMORY_LIMIT:-2g}
+    cpus: ${POSTGRES_CPUS_LIMIT:-2.0}
+    pids_limit: 256
+    restart: unless-stopped
+
+  init:
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pg_data:

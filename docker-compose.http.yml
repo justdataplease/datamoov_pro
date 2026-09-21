@@ -1,0 +1,44 @@
+# Explicit plain-HTTP overlay for trusted, isolated networks only.
+services:
+  edge:
+    labels:
+      com.datamov.edge-mode: insecure-http
+    ports: !override
+      - "${EDGE_HTTP_BIND_HOST:-127.0.0.1}:${EDGE_UI_PORT:-80}:3000"
+      - "127.0.0.1:${EDGE_API_PORT:-8000}:8000"
+    volumes: !override
+      - type: bind
+        source: ./nginx/edge.http.conf
+        target: /etc/nginx/conf.d/default.conf
+        read_only: true
+
+  init:
+    environment:
+      DATAMOV_INSECURE_HTTP_MODE: "true"
+      SESSION_COOKIE_SECURE: "false"
+      CSRF_COOKIE_SECURE: "false"
+      TRUST_PROXY_SSL_HEADER: "false"
+      SECURE_SSL_REDIRECT: "false"
+      SECURE_HSTS_SECONDS: "0"
+      SECURE_HSTS_INCLUDE_SUBDOMAINS: "false"
+      SECURE_HSTS_PRELOAD: "false"
+
+  backend:
+    environment:
+      DATAMOV_INSECURE_HTTP_MODE: "true"
+      SESSION_COOKIE_SECURE: "false"
+      CSRF_COOKIE_SECURE: "false"
+      TRUST_PROXY_SSL_HEADER: "false"
+      SECURE_SSL_REDIRECT: "false"
+      SECURE_HSTS_SECONDS: "0"
+      SECURE_HSTS_INCLUDE_SUBDOMAINS: "false"
+      SECURE_HSTS_PRELOAD: "false"
+
+  query-runner:
+    environment:
+      DATAMOV_INSECURE_HTTP_MODE: "true"
+      TRUST_PROXY_SSL_HEADER: "false"
+      SECURE_SSL_REDIRECT: "false"
+      SECURE_HSTS_SECONDS: "0"
+      SECURE_HSTS_INCLUDE_SUBDOMAINS: "false"
+      SECURE_HSTS_PRELOAD: "false"
