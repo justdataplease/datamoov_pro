@@ -34,7 +34,7 @@ You should see version `2.24.4` or higher.
 ## 2. Download this installer
 
 ```bash
-git clone https://github.com/staycaeegit/datamoov_pro.git
+git clone https://github.com/justdataplease/datamoov_pro.git
 cd datamoov_pro
 ```
 
