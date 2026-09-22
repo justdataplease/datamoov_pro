@@ -7,10 +7,9 @@ the application itself arrives as ready-made Docker images.
 
 - A Linux server (Ubuntu 22.04 or newer is the easy choice). The default
   settings are sized for 32 GB RAM and 16 CPUs; see [Smaller servers](#smaller-servers).
-- The GitHub **username** and **access token** we sent you.
 - Optional: a domain name (like `data.yourcompany.com`) pointing at the server.
 
-The whole install is five steps and takes about 15 minutes.
+The whole install is four steps and takes about 15 minutes.
 
 ---
 
@@ -38,18 +37,7 @@ git clone https://github.com/justdataplease/datamoov_pro.git
 cd datamoov_pro
 ```
 
-## 3. Log in to the image registry
-
-Use the username and token we sent you (paste the token when asked for a
-password; nothing appears as you paste, that is normal):
-
-```bash
-docker login ghcr.io -u YOUR_GITHUB_USERNAME
-```
-
-You should see `Login Succeeded`.
-
-## 4. Answer three questions
+## 3. Answer three questions
 
 ```bash
 ./setup.sh
@@ -70,13 +58,13 @@ You should see `Login Succeeded`.
 | Only an IP address, private office network or VPN | **2** HTTP | No encryption. Never use this on the open internet: passwords would travel in clear text. |
 | Your own reverse proxy or tunnel (nginx, Cloudflare Tunnel, ...) | **3** | datamoov listens on `127.0.0.1:80`; point your proxy there. |
 
-The script prints a **one-time setup token**. Copy it; you need it in step 5.
+The script prints a **one-time setup token**. Copy it; you need it in step 4.
 
 > **Back up the `.env` file** the script created (a password manager is fine).
 > It holds the key that encrypts your saved credentials. If it is lost, they
 > cannot be recovered.
 
-## 5. Start datamoov
+## 4. Start datamoov
 
 ```bash
 docker compose pull
@@ -180,8 +168,7 @@ Below 8 GB RAM is not supported.
 
 | Problem | Fix |
 | --- | --- |
-| `docker login` says `denied` | The token is wrong or expired. Ask us for a new one. |
-| `pull access denied` during step 5 | You skipped step 3, or your token has no access. |
+| `pull access denied` during step 4 | Run `docker logout ghcr.io`, then try again. |
 | Start-up stops at `init` | Run `docker compose logs init`. The last lines say what is wrong, most often the database URL. |
 | Browser says "not private" | Expected with HTTPS on a bare IP address. Use a domain to get a trusted certificate. |
 | HTTPS certificate is not issued | The domain must point at this server, and ports 80 and 443 must be open in the firewall. Check `docker compose logs https`. |
