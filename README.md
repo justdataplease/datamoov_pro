@@ -72,13 +72,15 @@ docker compose up -d --wait --wait-timeout 900
 ```
 
 The first start takes a few minutes while the database is prepared. When the
-command returns, open your address in a browser and add `/bootstrap`:
+command returns, open your address in a browser:
 
 ```text
-https://data.yourcompany.com/bootstrap
+https://data.yourcompany.com
 ```
 
-Paste the one-time setup token and create your administrator account.
+The first screen is **Create the administrator**. Enter your email, a
+password, and the one-time setup token. From then on the address opens the
+normal sign-in page.
 
 **Last step, for safety.** Open `.env`, delete everything after
 `BOOTSTRAP_TOKEN=` so the line is empty, then run:
