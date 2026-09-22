@@ -80,14 +80,7 @@ https://data.yourcompany.com
 
 The first screen is **Create the administrator**. Enter your email, a
 password, and the one-time setup token. From then on the address opens the
-normal sign-in page.
-
-**Last step, for safety.** Open `.env`, delete everything after
-`BOOTSTRAP_TOKEN=` so the line is empty, then run:
-
-```bash
-docker compose up -d --no-deps --force-recreate backend
-```
+normal sign-in page, and the setup token can never be used again.
 
 Done. 🎉
 
